@@ -50,14 +50,15 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 
 uint8_t buffer[64]; //Буфер для приёма сообщений от компа
-uint32_t count, lg, speed;
-uint8_t message[8] = {'\0'};
+int count, lg, speed, endStopSize;
+int deadZone = 5;
+uint8_t message[64] = {'\0'};
 uint32_t calBuffer[9]; //{0 Начало калибровки, 1 ES_1_B, 2 ES_1_E, 3 ES_2_B, 4 ES_2_E, 5 stop_start, 6 stop_end, 7 ES1_pos, 8 ES2_pos}
-uint32_t deselerationDist;
-uint32_t breakAt[2]; //Координата торможения, целевая координата
-uint8_t move; //направление вращения n=стоит, f=в +, b=в -
+int deselerationDist;
+int breakAt[2]; //Координата торможения, целевая координата
+uint8_t move = 'n'; //направление вращения n=стоит, f=в +, b=в -
 union {
-	int32_t u32;
+	uint32_t u32;
 	uint8_t u8[4];
 } u;
 
@@ -135,6 +136,7 @@ int main(void)
 	void calibrate () {	  
 	  
 	  sendData("\nCalibration start", 18);
+	  HAL_TIM_Base_Stop_IT(&htim1);
 	  TIM4->ARR = 65535;
 	  //Проверка статичности колеса
 	  memset(calBuffer, 0, sizeof(calBuffer));
@@ -176,31 +178,35 @@ int main(void)
 	  
 	  //Применение результатов калибровки
 	  deselerationDist = delta(calBuffer[6], calBuffer[5]);
-	  calBuffer[7] = calBuffer[1]; //delta(calBuffer[2], delta(calBuffer[2], calBuffer[1]) / 2);
-	  calBuffer[8] = calBuffer[3]; //delta(calBuffer[4], delta(calBuffer[4], calBuffer[3]) / 2);
+	  calBuffer[7] = calBuffer[1] + delta(calBuffer[2], calBuffer[1]) / 2;
+	  calBuffer[8] = calBuffer[3] + delta(calBuffer[4], calBuffer[3]) / 2;
+	  endStopSize = (delta(calBuffer[2], calBuffer[1]) + delta(calBuffer[4], calBuffer[3])) /4;
 	  TIM4->CNT = deselerationDist;
 	  TIM4->ARR = delta(calBuffer[8], calBuffer[7]);
-	  lg = sprintf(message, "\nCalibration end, ARR=%d, CNT=%d", TIM4->ARR, TIM4->CNT);
+	  lg = sprintf(message, "\nCalibration end, ARR=%d, CNT=%d, EndStopSize=%d", TIM4->ARR, TIM4->CNT, endStopSize);
 	  sendData(message, lg);
+	  HAL_TIM_Base_Start_IT(&htim1);
 	}
 
 	void goToPos (int targetPos) {
 		uint32_t disToMove[3] = {0, 0, deselerationDist}; //{по часовой, против часовой}	
 		//breakAt = 0;
 		
-		if (targetPos < TIM4->ARR && targetPos > 0) {
-			lg = sprintf(message, "\nMoving to %d", targetPos);
+		if (targetPos > TIM4->ARR || targetPos < 0) {
+			lg = sprintf(message, "\nErr, pos %d out of range", targetPos);
 			sendData(message, lg);
-		} else {
-			lg = sprintf(message, "\nErr pos %d out of range", targetPos);
+			return;
+		}
+		if (move != 'n') {
+			lg = sprintf(message, "\nErr, moving");
 			sendData(message, lg);
 			return;
 		}
 		
 
 		//Вычисление дистанций движения в обе стороны
-		if (TIM4->CNT < targetPos) {disToMove[0] = targetPos - TIM4->CNT; disToMove[1] = (TIM4->ARR - targetPos) + TIM4->CNT;}
-		else if (TIM4->CNT > targetPos) {disToMove[0] = TIM4->ARR - TIM4->CNT + targetPos; disToMove[1] = TIM4->CNT - targetPos;}
+		if (TIM4->CNT < targetPos - deadZone) {disToMove[0] = targetPos - TIM4->CNT; disToMove[1] = (TIM4->ARR - targetPos) + TIM4->CNT;}
+		else if (TIM4->CNT > targetPos + deadZone) {disToMove[0] = TIM4->ARR - TIM4->CNT + targetPos; disToMove[1] = TIM4->CNT - targetPos;}
 		else {return;}
 
 		//определение направления
@@ -238,7 +244,7 @@ int main(void)
 		else if (move == 'b') {HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);}
 
 		//Дебаг сообщения
-		lg = sprintf(message, "\nbreakeAt %d, move %c, DTM f=%d, DTM b=%d, break dist=%d", breakAt[0], move, disToMove[0], disToMove[1], disToMove[2]);
+		lg = sprintf(message, "\nMove to %d, dir %c", targetPos, move);
 		sendData(message, lg);
 		
 	}
@@ -254,17 +260,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  count = TIM4->CNT; //получение данных энкодера
-
-	  if (count > TIM4->ARR/2) {
-		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-		  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
-	  } else {
-		  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-		  //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
-	  } //мигалка
-
-	  //Обработка команд
+	//Обработка команд
 	switch (buffer[0]) {
 		case 'c':
 			calibrate();
@@ -279,8 +275,6 @@ int main(void)
 			goToPos(0);
 			break;
 		case 'p':
-			lg = sprintf(message, "\n%d", TIM4->CNT);
-			sendData(message, lg);
 			break;
 		case 't':
 			u.u32 = 2054781047;
@@ -315,14 +309,16 @@ int main(void)
 	  memset(buffer, 0, sizeof(buffer));
 
 	  //Ожидание координаты остановки
-	  if (move == 'f' && ((breakAt[0] < breakAt[1] && TIM4->CNT >= breakAt[0]) || (breakAt[0] > breakAt[1] && (TIM4->CNT >= breakAt[0] || TIM4->CNT < breakAt[1])))) {
+	  if (move == 'f' && ((breakAt[0] < breakAt[1] && TIM4->CNT >= breakAt[0] && TIM4->CNT < breakAt[1]) || (breakAt[0] > breakAt[1] && (TIM4->CNT >= breakAt[0] || TIM4->CNT < breakAt[1])))) {
 		  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+		  lg = sprintf(message, "\nmove done");
+		  sendData(message, lg);
 		  move = 'n';
-		  sendData("\ndone F", 7);
-	  } else if (move == 'b' && ((breakAt[0] > breakAt[1] && TIM4->CNT <= breakAt[0]) || (breakAt[0] < breakAt[1] && (TIM4->CNT <= breakAt[0] || TIM4->CNT > breakAt[1])))) {
+	  } else if (move == 'b' && ((breakAt[0] > breakAt[1] && TIM4->CNT <= breakAt[0] && TIM4->CNT > breakAt[1]) || (breakAt[0] < breakAt[1] && (TIM4->CNT <= breakAt[0] || TIM4->CNT > breakAt[1])))) {
 		  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+		  lg = sprintf(message, "\nmove done");
+		  sendData(message, lg);
 		  move = 'n';
-		  sendData("\ndone B", 7);
 	  }
   }
 

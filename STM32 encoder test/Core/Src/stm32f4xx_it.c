@@ -20,6 +20,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f4xx_it.h"
+#include <stdlib.h>
+#include <stdio.h>  
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
@@ -41,9 +43,10 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-uint32_t cnt, lg2, dBug;
-uint8_t message2[8] = {'\0'};
-extern uint32_t speed;
+uint32_t cnt, lg2, i, diode;
+uint16_t InterseptClock[2], lastSpeed, lastPos;
+uint8_t message2[64] = {'\0'};
+extern int speed, endStopSize;
 uint32_t delta(uint32_t num_1, uint32_t num_2);
 /* USER CODE END PV */
 
@@ -208,29 +211,50 @@ void SysTick_Handler(void)
 void TIM1_UP_TIM10_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM1_UP_TIM10_IRQn 0 */
+  void togleDiode() {
+      if(diode == 1) {
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+          diode = 0;
+      } else {
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+          diode = 1;
+      }
+  }
 
-  // �������� ��������� � ��������� �������� � �������� 60��
-  if (cnt != TIM4->CNT && dBug != 59) {
+  // Отправка координаты с частотой 60гц
+  if (cnt != TIM4->CNT && InterseptClock[1] != 59) {
+      togleDiode();
       lg2 = sprintf(message2, "\n%d", TIM4->CNT);
       CDC_Transmit_FS(message2, lg2);
-  } else if (dBug == 59) {
-      //lg2 = sprintf(message2, "\n%d", TIM4->CNT);
-      //CDC_Transmit_FS(message2, lg2);
-      dBug = 0;
+  } else if (InterseptClock[1] == 59) {
+      togleDiode();
+      lg2 = sprintf(message2, "\n%d", TIM4->CNT);
+      CDC_Transmit_FS(message2, lg2);
+      InterseptClock[1] = 0;
   }
-  lg2 = delta(cnt, TIM4->CNT);
-  if (lg2 > TIM4->ARR*0.9) {
-      if (TIM4->CNT > cnt) {
-          speed = cnt + (TIM4->ARR - TIM4->CNT);
-      } else {
-          speed = TIM4->CNT + (TIM4->ARR - cnt);
-      }
-  } else {
-    speed = lg2;
-  }
-  cnt = TIM4->CNT;
+  cnt = TIM4->CNT; //Сохранение предыдущей позиции для отправки координаты
 
-  dBug ++;
+  //вычисление скорости с частотой 6гц
+  if (InterseptClock[1] == 9) {
+      speed = TIM4->CNT - lastPos;
+      if (abs(speed) >= TIM4->ARR * 0.9) {
+          speed = lastSpeed;
+      }
+      lastSpeed = speed;
+      lastPos = TIM4->CNT;
+  }
+
+  if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_SET && i==0) {
+      i = 1;
+      if (speed > 0) {
+          TIM4->CNT = TIM4->ARR - endStopSize;
+      } else {
+          TIM4->CNT = endStopSize;
+      }
+      CDC_Transmit_FS(" Position fixed", 15);
+  } else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_RESET) {i = 0;}
+
+  InterseptClock[1] ++; InterseptClock[2] ++;
   /* USER CODE END TIM1_UP_TIM10_IRQn 0 */
   HAL_TIM_IRQHandler(&htim1);
   /* USER CODE BEGIN TIM1_UP_TIM10_IRQn 1 */
